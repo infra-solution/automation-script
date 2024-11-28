@@ -1,0 +1,88 @@
+param (
+    [string]$ClusterName,
+    [string]$ResourceGroupName,
+    [string]$TargetVersion,
+    [switch]$Force
+)
+
+function Get-UserInput($Prompt, $Options) {
+    Write-Host $Prompt
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        Write-Host "$($i + 1): $($Options[$i])"
+    }
+    do {
+        $Choice = Read-Host "Enter your choice (1-$($Options.Count))"
+    } while (-not ($Choice -match '^\d+$' -and $Choice -ge 1 -and $Choice -le $Options.Count))
+    return $Options[$Choice - 1]
+}
+
+# List AKS clusters if ClusterName and ResourceGroupName are not provided
+if (-not $ClusterName -or -not $ResourceGroupName) {
+    Write-Host "Fetching AKS clusters..."
+    $Clusters = az aks list --query "[].{Name:name, ResourceGroup:resourceGroup}" -o json | ConvertFrom-Json
+    if ($Clusters.Count -eq 0) {
+        Write-Host "No AKS clusters found. Exiting..." -ForegroundColor Red
+        exit
+    }
+    $SelectedCluster = Get-UserInput "Select an AKS cluster to upgrade:" $Clusters
+    $ClusterName = $SelectedCluster.Name
+    $ResourceGroupName = $SelectedCluster.ResourceGroup
+}
+
+# Fetch available Kubernetes versions
+if (-not $TargetVersion) {
+    Write-Host "Fetching available upgrade versions for AKS cluster: $ClusterName..."
+    $UpgradeInfo = az aks get-upgrades --resource-group $ResourceGroupName --name $ClusterName -o json | ConvertFrom-Json
+    if (-not $UpgradeInfo.controlPlaneProfile.upgrades) {
+        Write-Host "No upgrades available for this cluster. Exiting..." -ForegroundColor Red
+        exit
+    }
+    $AvailableVersions = $UpgradeInfo.controlPlaneProfile.upgrades | ForEach-Object { $_.kubernetesVersion }
+    $TargetVersion = Get-UserInput "Select a version to upgrade to:" $AvailableVersions
+}
+
+# Confirmation if not forced
+if (-not $Force) {
+    Write-Host "Pre-upgrade checklist:"
+    Write-Host "1. Verify IP address availability in the subnet."
+    Write-Host "2. Verify quota limits."
+    Write-Host "3. Verify Pod Disruption Budget (PDB) for critical applications."
+    $Confirmation = Read-Host "Have you completed the prerequisites? (yes/no)"
+    if ($Confirmation -ne "yes") {
+        Write-Host "Prerequisites not confirmed. Exiting..." -ForegroundColor Red
+        exit
+    }
+}
+
+# Upgrade Control Plane
+Write-Host "Upgrading control plane to version $TargetVersion..."
+az aks upgrade --resource-group $ResourceGroupName --name $ClusterName --kubernetes-version $TargetVersion --control-plane-only --yes
+
+# Upgrade Node Pools
+Write-Host "Fetching node pools for AKS cluster: $ClusterName..."
+$NodePools = az aks nodepool list --resource-group $ResourceGroupName --cluster-name $ClusterName -o json | ConvertFrom-Json
+
+foreach ($NodePool in $NodePools) {
+    $NodePoolName = $NodePool.name
+    Write-Host "Processing node pool: $NodePoolName..."
+
+    # Create a new node pool with the same configuration
+    $NewNodePoolName = "$NodePoolName-new"
+    Write-Host "Creating new node pool: $NewNodePoolName..."
+    az aks nodepool add --resource-group $ResourceGroupName --cluster-name $ClusterName --name $NewNodePoolName `
+        --node-count $NodePool.count --node-vm-size $NodePool.vmSize `
+        --vnet-subnet-id $NodePool.vnetSubnetId
+
+    # Cordon and drain nodes in the old pool
+    Write-Host "Cordoning nodes in node pool: $NodePoolName..."
+    az aks nodepool cordon --resource-group $ResourceGroupName --cluster-name $ClusterName --name $NodePoolName
+
+    Write-Host "Draining nodes in node pool: $NodePoolName..."
+    az aks nodepool drain --resource-group $ResourceGroupName --cluster-name $ClusterName --name $NodePoolName
+
+    # Delete the old node pool
+    Write-Host "Deleting old node pool: $NodePoolName..."
+    az aks nodepool delete --resource-group $ResourceGroupName --cluster-name $ClusterName --name $NodePoolName
+}
+
+Write-Host "AKS cluster upgrade completed successfully!"
