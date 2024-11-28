@@ -1,88 +1,172 @@
-param (
+param(
     [string]$ClusterName,
     [string]$ResourceGroupName,
     [string]$TargetVersion,
     [switch]$Force
 )
 
-function Get-UserInput($Prompt, $Options) {
-    Write-Host $Prompt
-    for ($i = 0; $i -lt $Options.Count; $i++) {
-        Write-Host "$($i + 1): $($Options[$i])"
+# Function to ensure prerequisites
+function Check-Prerequisites {
+    Write-Host "Checking prerequisites..."
+    $currentContext = kubectl config current-context
+    if (-not $currentContext) {
+        Write-Error "kubectl context is not set. Please configure kubectl to connect to your AKS cluster."
+        exit 1
     }
-    do {
-        $Choice = Read-Host "Enter your choice (1-$($Options.Count))"
-    } while (-not ($Choice -match '^\d+$' -and $Choice -ge 1 -and $Choice -le $Options.Count))
-    return $Options[$Choice - 1]
+    Write-Host "kubectl is configured for context: $currentContext"
 }
 
-# List AKS clusters if ClusterName and ResourceGroupName are not provided
-if (-not $ClusterName -or -not $ResourceGroupName) {
-    Write-Host "Fetching AKS clusters..."
-    $Clusters = az aks list --query "[].{Name:name, ResourceGroup:resourceGroup}" -o json | ConvertFrom-Json
-    if ($Clusters.Count -eq 0) {
-        Write-Host "No AKS clusters found. Exiting..." -ForegroundColor Red
-        exit
+# Function to cordon, drain, and delete nodes in a node pool
+function Manage-NodePool {
+    param (
+        [string]$NodePoolName
+    )
+
+    # List all nodes in the node pool
+    $nodes = kubectl get nodes -l agentpool=$NodePoolName -o name
+    if (-not $nodes) {
+        Write-Error "No nodes found in the node pool: $NodePoolName"
+        exit 1
     }
-    $SelectedCluster = Get-UserInput "Select an AKS cluster to upgrade:" $Clusters
-    $ClusterName = $SelectedCluster.Name
-    $ResourceGroupName = $SelectedCluster.ResourceGroup
-}
 
-# Fetch available Kubernetes versions
-if (-not $TargetVersion) {
-    Write-Host "Fetching available upgrade versions for AKS cluster: $ClusterName..."
-    $UpgradeInfo = az aks get-upgrades --resource-group $ResourceGroupName --name $ClusterName -o json | ConvertFrom-Json
-    if (-not $UpgradeInfo.controlPlaneProfile.upgrades) {
-        Write-Host "No upgrades available for this cluster. Exiting..." -ForegroundColor Red
-        exit
+    foreach ($node in $nodes) {
+        Write-Host "Processing node: $node"
+
+        # Cordon the node
+        kubectl cordon $node
+        if ($?) {
+            Write-Host "Node cordoned successfully: $node"
+        } else {
+            Write-Error "Failed to cordon node: $node"
+            exit 1
+        }
+
+        # Drain the node
+        kubectl drain $node --ignore-daemonsets --delete-emptydir-data --force
+        if ($?) {
+            Write-Host "Node drained successfully: $node"
+        } else {
+            Write-Error "Failed to drain node: $node"
+            exit 1
+        }
+
+        # Delete the node
+        Write-Host "Deleting node: $node"
+        az vm delete --name $node --yes --no-wait
+        if ($?) {
+            Write-Host "Node deleted successfully: $node"
+        } else {
+            Write-Error "Failed to delete node: $node"
+            exit 1
+        }
     }
-    $AvailableVersions = $UpgradeInfo.controlPlaneProfile.upgrades | ForEach-Object { $_.kubernetesVersion }
-    $TargetVersion = Get-UserInput "Select a version to upgrade to:" $AvailableVersions
 }
 
-# Confirmation if not forced
-if (-not $Force) {
-    Write-Host "Pre-upgrade checklist:"
-    Write-Host "1. Verify IP address availability in the subnet."
-    Write-Host "2. Verify quota limits."
-    Write-Host "3. Verify Pod Disruption Budget (PDB) for critical applications."
-    $Confirmation = Read-Host "Have you completed the prerequisites? (yes/no)"
-    if ($Confirmation -ne "yes") {
-        Write-Host "Prerequisites not confirmed. Exiting..." -ForegroundColor Red
-        exit
+# Function to clone node pool with the same configuration
+function Clone-NodePool {
+    param (
+        [string]$NodePoolName,
+        [string]$NewNodePoolName
+    )
+
+    # Fetch the configuration of the existing node pool
+    Write-Host "Fetching current node pool configuration for: $NodePoolName"
+    $nodePoolConfig = az aks nodepool show --resource-group $ResourceGroupName --cluster-name $ClusterName --name $NodePoolName
+
+    $vmSize = $nodePoolConfig.vmSize
+    $nodeCount = $nodePoolConfig.count
+    $enableAutoScaler = $nodePoolConfig.enableAutoScaling
+    $minNodeCount = $nodePoolConfig.minCount
+    $maxNodeCount = $nodePoolConfig.maxCount
+    $maxPods = $nodePoolConfig.maxPods
+    $mode = $nodePoolConfig.mode
+
+    Write-Host "Creating new node pool: $NewNodePoolName"
+    az aks nodepool add `
+        --resource-group $ResourceGroupName `
+        --cluster-name $ClusterName `
+        --name $NewNodePoolName `
+        --node-count $nodeCount `
+        --node-vm-size $vmSize `
+        --enable-cluster-autoscaler $enableAutoScaler `
+        --min-count $minNodeCount `
+        --max-count $maxNodeCount `
+        --max-pods $maxPods `
+        --mode $mode `
+        --no-wait
+    if ($?) {
+        Write-Host "Node pool created successfully: $NewNodePoolName"
+    } else {
+        Write-Error "Failed to create node pool: $NewNodePoolName"
+        exit 1
     }
 }
 
-# Upgrade Control Plane
-Write-Host "Upgrading control plane to version $TargetVersion..."
-az aks upgrade --resource-group $ResourceGroupName --name $ClusterName --kubernetes-version $TargetVersion --control-plane-only --yes
+# Main script
+function Upgrade-AKS {
+    # Check prerequisites
+    Check-Prerequisites
 
-# Upgrade Node Pools
-Write-Host "Fetching node pools for AKS cluster: $ClusterName..."
-$NodePools = az aks nodepool list --resource-group $ResourceGroupName --cluster-name $ClusterName -o json | ConvertFrom-Json
+    # Set parameters interactively if not provided
+    if (-not $ClusterName) {
+        $ClusterName = Read-Host "Enter the AKS cluster name"
+    }
+    if (-not $ResourceGroupName) {
+        $ResourceGroupName = Read-Host "Enter the resource group name"
+    }
+    if (-not $TargetVersion) {
+        Write-Host "Fetching available versions..."
+        $availableVersions = az aks get-upgrades --resource-group $ResourceGroupName --name $ClusterName --query "controlPlaneProfile.upgrades[].kubernetesVersion" -o tsv
+        Write-Host "Available versions: $availableVersions"
+        $TargetVersion = Read-Host "Enter the Kubernetes version to upgrade to"
+    }
 
-foreach ($NodePool in $NodePools) {
-    $NodePoolName = $NodePool.name
-    Write-Host "Processing node pool: $NodePoolName..."
+    # Confirmation
+    if (-not $Force) {
+        $confirmation = Read-Host "Have you verified prerequisites like IP availability, PDBs, and quota limits? (yes/no)"
+        if ($confirmation -ne "yes") {
+            Write-Error "Please verify prerequisites before proceeding."
+            exit 1
+        }
+    }
 
-    # Create a new node pool with the same configuration
-    $NewNodePoolName = "$NodePoolName-new"
-    Write-Host "Creating new node pool: $NewNodePoolName..."
-    az aks nodepool add --resource-group $ResourceGroupName --cluster-name $ClusterName --name $NewNodePoolName `
-        --node-count $NodePool.count --node-vm-size $NodePool.vmSize `
-        --vnet-subnet-id $NodePool.vnetSubnetId
+    # Upgrade control plane
+    Write-Host "Upgrading control plane to version $TargetVersion..."
+    az aks upgrade --resource-group $ResourceGroupName --name $ClusterName --kubernetes-version $TargetVersion --control-plane-only --yes
+    if ($?) {
+        Write-Host "Control plane upgraded successfully."
+    } else {
+        Write-Error "Failed to upgrade the control plane."
+        exit 1
+    }
 
-    # Cordon and drain nodes in the old pool
-    Write-Host "Cordoning nodes in node pool: $NodePoolName..."
-    az aks nodepool cordon --resource-group $ResourceGroupName --cluster-name $ClusterName --name $NodePoolName
+    # Upgrade node pools
+    Write-Host "Fetching node pools for cluster: $ClusterName..."
+    $nodePools = az aks nodepool list --resource-group $ResourceGroupName --cluster-name $ClusterName --query "[].name" -o tsv
+    foreach ($nodePool in $nodePools) {
+        Write-Host "Processing node pool: $nodePool"
 
-    Write-Host "Draining nodes in node pool: $NodePoolName..."
-    az aks nodepool drain --resource-group $ResourceGroupName --cluster-name $ClusterName --name $NodePoolName
+        # Generate new node pool name
+        $mode = az aks nodepool show --resource-group $ResourceGroupName --cluster-name $ClusterName --name $nodePool --query "mode" -o tsv
+        $newNodePoolName = "${mode}pool-${TargetVersion.Replace('.', '')}"
 
-    # Delete the old node pool
-    Write-Host "Deleting old node pool: $NodePoolName..."
-    az aks nodepool delete --resource-group $ResourceGroupName --cluster-name $ClusterName --name $NodePoolName
+        # Create a new node pool with the same configuration
+        Clone-NodePool -NodePoolName $nodePool -NewNodePoolName $newNodePoolName
+
+        # Wait for new node pool creation
+        Write-Host "Waiting for new node pool creation..."
+        Start-Sleep -Seconds 30
+
+        # Migrate workloads from old node pool
+        Manage-NodePool -NodePoolName $nodePool
+
+        # Delete the old node pool
+        Write-Host "Deleting old node pool: $nodePool"
+        az aks nodepool delete --resource-group $ResourceGroupName --cluster-name $ClusterName --name $nodePool --yes
+    }
+
+    Write-Host "AKS cluster upgrade completed successfully."
 }
 
-Write-Host "AKS cluster upgrade completed successfully!"
+# Run the upgrade function
+Upgrade-AKS
